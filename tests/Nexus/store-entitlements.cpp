@@ -1757,7 +1757,8 @@ static void test_can_acquire_signed( void )
     ( threads )->Release();
 }
 
-static void test_can_acquire_signed_fixture( void )
+static void test_can_acquire_signed_fixture(
+    void ( *operation )( HCRYPTPROV, const char *, PCCERT_CONTEXT ) = nullptr )
 {
     HCRYPTPROV provider = 0;
     HCRYPTKEY key = 0;
@@ -1794,7 +1795,8 @@ static void test_can_acquire_signed_fixture( void )
     if ( certificate_document.empty() ) goto done;
     metadata_body = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}}]}]})";
     metadata_mode = certificate_mode = true;
-    test_can_acquire_signed();
+    if ( operation ) operation( provider, cert_id, cert );
+    else test_can_acquire_signed();
     metadata_mode = certificate_mode = false;
     certificate_tamper = false;
     certificate_provider = 0;
@@ -2564,6 +2566,9 @@ static void WINAPI store_lifetime_completion( XAsyncBlock *block )
 
 static void test_current_game_result_lifetime()
 {
+    /* Synthetic provider-state checks stay here only for argument validation.
+     * The closed-handle delivery contract is covered by the genuine async
+     * operation in test_current_game_closed_handle_result() below. */
     XStoreContextHandle store = nullptr, other = nullptr;
     UINT64 xuid, serial;
     CHECK( "current-result-store", entitled_store_create( nullptr, &store ) == S_OK );
@@ -2588,6 +2593,7 @@ static void test_current_game_result_lifetime()
     context.game = TRUE;
     context.store = store;
     context.store_serial = serial;
+    memcpy( context.game_parent, storeId, sizeof( context.game_parent ) );
     context.page = &page;
     XStoreGameLicense result{};
     XAsyncProviderData data{};
@@ -2600,11 +2606,113 @@ static void test_current_game_result_lifetime()
     CHECK( "current-result-corrected-buffer-actual-sku", entitled_provider( XAsyncOp::GetResult, &data ) == S_OK &&
                                                              result.isActive &&
                                                              !strcmp( result.skuStoreId, "B00000000001/AB12" ) );
+    /* Contract correction: a completed current-game operation owns its captured
+     * signed proof, so closing the caller's public handle afterwards does not
+     * revoke the result. The proof itself is still revalidated on every call;
+     * the following checks prove the captured proof, not the handle, gates it. */
     entitled_store_close( store );
-    CHECK( "current-result-closed-context-refused", entitled_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+    CHECK( "current-result-closed-context-delivers-captured-proof",
+           entitled_provider( XAsyncOp::GetResult, &data ) == S_OK && result.isActive &&
+               !strcmp( result.skuStoreId, "B00000000001/AB12" ) );
     CHECK( "current-result-replacement-store", entitled_store_create( nullptr, &other ) == S_OK );
-    CHECK( "current-result-old-serial-never-rebound", entitled_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+    CHECK( "current-result-new-context-cannot-rebind-captured-proof",
+           entitled_provider( XAsyncOp::GetResult, &data ) == S_OK &&
+               !strcmp( result.skuStoreId, "B00000000001/AB12" ) );
     entitled_store_close( other );
+    proof.proof_until = time( nullptr ) - 1;
+    memset( &result, 0, sizeof( result ) );
+    CHECK( "current-result-expired-captured-proof-denied-after-close",
+           entitled_provider( XAsyncOp::GetResult, &data ) == E_ACCESSDENIED && !result.isActive );
+    proof.proof_until = time( nullptr ) + 600;
+    context.game_parent[0] = 0;
+    CHECK( "current-result-missing-captured-parent-denied",
+           entitled_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG && !result.isActive );
+    memcpy( context.game_parent, "B00000000002", sizeof( context.game_parent ) );
+    CHECK( "current-result-other-parent-denied",
+           entitled_provider( XAsyncOp::GetResult, &data ) == E_ACCESSDENIED && !result.isActive );
+    memcpy( context.game_parent, storeId, sizeof( context.game_parent ) );
+    context.page = nullptr;
+    CHECK( "current-result-missing-captured-proof-denied",
+           entitled_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+}
+
+/* Exercise only the actual failing lifetime with a locally signed receipt.
+ * Transport and certificate lookup stay inside the existing account-free fixture. */
+struct current_game_operation
+{
+    IXThreadingImpl *threads;
+    XAsyncBlock block;
+    LONG callbacks;
+};
+static void WINAPI current_game_operation_completed( XAsyncBlock *block )
+{
+    auto *operation = static_cast<current_game_operation *>( block->context );
+    InterlockedIncrement( &operation->callbacks );
+}
+static void test_current_game_closed_handle_result( HCRYPTPROV, const char *, PCCERT_CONTEXT )
+{
+    current_game_operation operation{};
+    XTaskQueueHandle queue = nullptr;
+    XStoreContextHandle store = nullptr;
+    XStoreGameLicense result{};
+    CHECK( "current-closed-threading", FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl,
+        ( void ** )&operation.threads ) == S_OK && operation.threads );
+    if ( !operation.threads ) return;
+    CHECK( "current-closed-queue", operation.threads->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+        XTaskQueueDispatchMode::Manual, &queue ) == S_OK && queue );
+    if ( !queue ) { operation.threads->Release(); return; }
+    metadata_body = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Game","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}}]}]})";
+    CHECK( "current-closed-store", entitled_store_create( nullptr, &store ) == S_OK && store );
+    if ( !store ) { operation.threads->XTaskQueueCloseHandle( queue ); operation.threads->Release(); return; }
+    operation.block.queue = queue;
+    operation.block.context = &operation;
+    operation.block.callback = current_game_operation_completed;
+    HRESULT begin = entitled_begin( store, 4, ENTITLED_MAX_PRODUCTS, &operation.block, TRUE );
+    CHECK( "current-closed-begin", begin == S_OK );
+    entitled_store_close( store );
+    if ( FAILED( begin ) ) { operation.threads->XTaskQueueCloseHandle( queue ); operation.threads->Release(); return; }
+    XAsyncBlock rejected{};
+    CHECK( "current-closed-new-begin-refused", entitled_begin( store, 4, ENTITLED_MAX_PRODUCTS,
+        &rejected, TRUE ) == E_INVALIDARG );
+    CHECK( "current-closed-pending", operation.threads->XAsyncGetStatus( &operation.block, FALSE ) == E_PENDING );
+    const bool dispatched = operation.threads->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 );
+    CHECK( "current-closed-work", dispatched );
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    while ( dispatched && GetTickCount64() < deadline &&
+        ( !InterlockedCompareExchange( &operation.callbacks, 0, 0 ) ||
+          operation.threads->XAsyncGetStatus( &operation.block, FALSE ) == E_PENDING ) )
+    {
+        operation.threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 );
+        Sleep( 1 );
+    }
+    const bool completed = operation.callbacks == 1 &&
+        operation.threads->XAsyncGetStatus( &operation.block, FALSE ) != E_PENDING;
+    CHECK( "current-closed-completed", completed );
+    if ( !completed )
+    {
+        // Do not reuse a live async block or destroy data still owned by a worker.
+        fflush( stdout );
+        ExitProcess( 1 );
+    }
+    CHECK( "current-closed-worker-success", operation.threads->XAsyncGetStatus( &operation.block, FALSE ) == S_OK );
+    CHECK( "current-closed-null-buffer-retained", operation.threads->XAsyncGetResult( &operation.block,
+        &entitled_game_identity, sizeof( result ), nullptr, nullptr ) == E_INVALIDARG );
+    CHECK( "current-closed-small-buffer-retained", operation.threads->XAsyncGetResult( &operation.block,
+        &entitled_game_identity, sizeof( result ) - 1, &result, nullptr ) == E_NOT_SUFFICIENT_BUFFER );
+    CHECK( "current-closed-wrong-family-retained", operation.threads->XAsyncGetResult( &operation.block,
+        &entitled_identity, sizeof( result ), &result, nullptr ) == E_INVALIDARG );
+    const char *original_parent = storeId;
+    storeId = "B00000000002";
+    const HRESULT delivered = operation.threads->XAsyncGetResult( &operation.block,
+        &entitled_game_identity, sizeof( result ), &result, nullptr );
+    storeId = original_parent;
+    CHECK( "current-closed-delivers-own-captured-parent", delivered == S_OK && result.isActive &&
+        !strcmp( result.skuStoreId, "B00000000001/0010" ) && !result.isTrial &&
+        result.expirationDate > static_cast<INT64>( time( nullptr ) ) );
+    CHECK( "current-closed-single-consumption", operation.threads->XAsyncGetResult( &operation.block,
+        &entitled_game_identity, sizeof( result ), &result, nullptr ) == E_ILLEGAL_METHOD_CALL );
+    operation.threads->XTaskQueueCloseHandle( queue );
+    operation.threads->Release();
 }
 
 struct immediate_license_observation
@@ -3310,6 +3418,22 @@ static void test_collection_metadata()
 
 int main( int argc, char **argv )
 {
+    if ( argc == 2 && !strcmp( argv[1], "--current-game-lifetime-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        if ( !dll || !( runtime_query = reinterpret_cast<decltype( runtime_query )>(
+            GetProcAddress( dll, "QueryApiImpl" ) ) ) ) return 2;
+        const auto init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "current-lifetime-winrt", SUCCEEDED( init ) );
+        if ( SUCCEEDED( init ) )
+        {
+            test_current_game_result_lifetime();
+            test_can_acquire_signed_fixture( test_current_game_closed_handle_result );
+            RoUninitialize();
+        }
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     if ( argc == 2 && !strcmp( argv[1], "--dlc-inputs-only" ) )
     {
         HMODULE dll = LoadLibraryA( "xgameruntime.dll" );

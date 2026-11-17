@@ -10,6 +10,10 @@
 #define CONTENT_MAX_DIRECTORIES 512
 #define CONTENT_MAX_IDS 256
 #define CONTENT_XML_LIMIT ( 1024 * 1024 )
+/* A package layout can legitimately declare tens of thousands of FileGroups.
+ * Only the layout reader is allowed the larger, still fixed bound; every other
+ * XML input keeps CONTENT_XML_LIMIT. */
+#define CONTENT_LAYOUT_XML_LIMIT ( 8 * 1024 * 1024 )
 
 struct content_game
 {
@@ -108,7 +112,10 @@ static BOOL content_join( const WCHAR *root, const WCHAR *name, WCHAR *out )
     return TRUE;
 }
 
-static xmlDocPtr content_read_xml( const WCHAR *path )
+/* The byte bound is explicit so a caller can name a larger fixed limit; the
+ * default stays CONTENT_XML_LIMIT. Sharing, allocation and parse policy are
+ * identical for every bound. */
+static xmlDocPtr content_read_xml( const WCHAR *path, UINT64 limit = CONTENT_XML_LIMIT )
 {
     HANDLE file;
     LARGE_INTEGER size;
@@ -118,7 +125,7 @@ static xmlDocPtr content_read_xml( const WCHAR *path )
     file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                         FILE_ATTRIBUTE_NORMAL, NULL );
     if ( file == INVALID_HANDLE_VALUE ) return NULL;
-    if ( !GetFileSizeEx( file, &size ) || size.QuadPart <= 0 || size.QuadPart > CONTENT_XML_LIMIT ||
+    if ( !GetFileSizeEx( file, &size ) || size.QuadPart <= 0 || size.QuadPart > limit ||
          !( bytes = static_cast<std::remove_reference_t<decltype( bytes )>>( malloc( size.QuadPart ) ) ) )
     {
         CloseHandle( file );
@@ -526,7 +533,7 @@ static BOOL content_load_layout( struct content_package *package )
             valid = FALSE;
             break;
         }
-        doc = content_read_xml( path );
+        doc = content_read_xml( path, CONTENT_LAYOUT_XML_LIMIT );
         root = doc ? xmlDocGetRootElement( doc ) : NULL;
         valid = root && !strcmp( ( char * )root->name, "Package" ) &&
                 content_layout_coordinate( package->path, root->children, &coordinate, &groups ) && groups;

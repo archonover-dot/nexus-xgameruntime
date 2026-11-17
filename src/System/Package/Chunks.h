@@ -4,6 +4,10 @@
 #define CHUNKS_MAX 4096
 #define CHUNKS_TEXT_MAX 1024
 #define CHUNKS_FILES_MAX 65536
+/* A layout may declare tens of thousands of FileGroups across thousands of
+ * chunks; the real FH5 layout has 21,488. The bound is fixed and independent
+ * of the file, chunk and entry limits, which are unchanged. */
+#define CHUNKS_FILE_GROUPS_MAX 65536
 #include <cstdio>
 
 struct chunk_group
@@ -238,7 +242,7 @@ static HRESULT chunks_files( const WCHAR *root, xmlNodePtr chunk, struct chunk_s
     for ( node = chunk->children; node; node = node->next )
     {
         if ( node->type != XML_ELEMENT_NODE ) continue;
-        if ( strcmp( ( char * )node->name, "FileGroup" ) || ++snapshot->groups > 16384 ||
+        if ( strcmp( ( char * )node->name, "FileGroup" ) || ++snapshot->groups > CHUNKS_FILE_GROUPS_MAX ||
              !content_text( node, "Include", include, sizeof( include ) ) || !content_relative( include, TRUE ) )
             return HRESULT_FROM_WIN32( ERROR_INVALID_DATA );
         if ( xmlHasProp( node, ( xmlChar * )"Exclude" ) || node->children ) return E_NOTIMPL;
@@ -524,7 +528,7 @@ static HRESULT chunks_load( const char *identifier, BOOL track_sizes, struct chu
     } while ( FindNextFileW( find, &data ) );
     FindClose( find );
     if ( !layout_valid || layouts != 1 ) goto done;
-    doc = content_read_xml( file );
+    doc = content_read_xml( file, CONTENT_LAYOUT_XML_LIMIT );
     root = doc ? xmlDocGetRootElement( doc ) : NULL;
     if ( !root || strcmp( ( char * )root->name, "Package" ) ) goto done;
     for ( node = root->children; node; node = node->next )
