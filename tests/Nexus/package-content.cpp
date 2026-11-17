@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <new>
+#include <libxml/xmlerror.h>
 #include "../../src/System/XPackage.cpp"
 #include <xstore.h>
 
@@ -1041,6 +1043,334 @@ static void test_deployed_host_source()
     SetEnvironmentVariableW( L"XODUS_CONTENT_ROOTS", folder );
 }
 
+/* FH5 layout size: a package layout is a large, still fixed, XML input. The
+ * reader's default bound stays CONTENT_XML_LIMIT; only the layout readers name
+ * CONTENT_LAYOUT_XML_LIMIT. The chunk reader's separate FileGroup bound must
+ * cover a real title layout (21,488 groups) without lifting the chunk, file,
+ * per-group entry or path limits. Every layout here is synthetic: no game bits
+ * are copied, and nothing is licensed, mounted or installed. */
+static BOOL layout_write( const WCHAR *path, const char *text, SIZE_T length )
+{
+    HANDLE file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
+    DWORD written;
+    BOOL ok = file != INVALID_HANDLE_VALUE && length <= MAXDWORD &&
+              WriteFile( file, text, ( DWORD )length, &written, NULL ) && written == length;
+    if ( file != INVALID_HANDLE_VALUE ) CloseHandle( file );
+    CHECK( "layout-write", ok );
+    return ok;
+}
+
+/* Real FH5 layout: 3,577,674 bytes, 1,959 chunks, 21,488 FileGroups. These
+ * synthetic groups are larger than FH5's, so the filler is calibrated to keep
+ * the fixture near the real size instead of inventing a smaller one. */
+#define LAYOUT_REAL_BYTES 3577674
+#define LAYOUT_REAL_CHUNKS 1958 /* Numeric chunks plus registration give 1,959. */
+#define LAYOUT_REAL_GROUPS 21488
+
+/* Deterministic filler: one or more XML comments totalling exactly `bytes`.
+ * libxml2 rejects a single text node longer than XML_MAX_TEXT_LENGTH, so the
+ * filler is split instead of relying on an oversized comment. */
+#define LAYOUT_FILLER_NODE ( 4 * 1024 * 1024 )
+static SIZE_T layout_filler( char *out, SIZE_T bytes )
+{
+    SIZE_T used = 0;
+    while ( bytes >= 8 )
+    {
+        SIZE_T part = bytes < LAYOUT_FILLER_NODE ? bytes : LAYOUT_FILLER_NODE;
+        SIZE_T i;
+        memcpy( out + used, "<!--", 4 );
+        for ( i = 4; i + 3 < part; ++i ) out[used + i] = 'x';
+        memcpy( out + used + part - 3, "-->", 3 );
+        used += part;
+        bytes -= part;
+    }
+    return used;
+}
+
+/* Real-shape layout: registration plus `chunks` chunks, `groups` FileGroups in
+ * total, `filler` comment bytes, and an optional tail inserted just before the
+ * root close so a rejection is attributable to the tail, not a truncation. */
+static SIZE_T layout_build( char *text, SIZE_T size, UINT chunks, UINT groups, SIZE_T filler, const char *tail )
+{
+    SIZE_T used = 0;
+    UINT chunk, index = 0;
+    int count;
+    /* The registration chunk holds one group; the rest are spread over
+     * `chunks` chunks, so at least one group must remain for them. */
+    if ( size < 256 || !chunks || groups < 2 || chunks > groups - 1 ) return 0;
+    count = snprintf( text, size, "<?xml version=\"1.0\" encoding=\"us-ascii\"?>\n<Package>\n"
+                                  "  <Chunk Id=\"Registration\" Tags=\"OffDisc\">\n"
+                                  "    <FileGroup DestinationPath=\"\\\" SourcePath=\".\\\" Include=\"MicrosoftGame.Config\" />\n"
+                                  "  </Chunk>\n" );
+    if ( count < 0 || ( SIZE_T )count >= size ) return 0;
+    used = count;
+    for ( chunk = 1; chunk <= chunks; ++chunk )
+    {
+        UINT in_chunk = 1 + ( groups - 1 - chunks ) / chunks + ( chunk <= ( groups - 1 - chunks ) % chunks ? 1 : 0 );
+        count = snprintf( text + used, size - used, "  <Chunk Id=\"%u\" Tags=\"OffDisc\">\n", chunk );
+        if ( count < 0 || ( SIZE_T )count >= size - used ) return 0;
+        used += count;
+        while ( in_chunk )
+        {
+            --in_chunk;
+            count = snprintf( text + used, size - used,
+                              "    <FileGroup DestinationPath=\"\\media\\assets\" SourcePath=\".\\media\\assets\""
+                              " Include=\"synthetic_%u.dat\" />\n",
+                              index++ );
+            if ( count < 0 || ( SIZE_T )count >= size - used ) return 0;
+            used += count;
+        }
+        count = snprintf( text + used, size - used, "  </Chunk>\n" );
+        if ( count < 0 || ( SIZE_T )count >= size - used ) return 0;
+        used += count;
+    }
+    if ( filler && used + filler + 32 >= size ) return 0;
+    used += layout_filler( text + used, filler );
+    if ( tail )
+    {
+        SIZE_T length = strlen( tail );
+        if ( used + length + 32 >= size ) return 0;
+        memcpy( text + used, tail, length );
+        used += length;
+    }
+    count = snprintf( text + used, size - used, "</Package>" );
+    if ( count < 0 || ( SIZE_T )count >= size - used ) return 0;
+    return used + count;
+}
+
+/* Enumerate one synthetic package through the real discovery path. The fixture
+ * is created separately so a caller can replace its layout first. */
+static unsigned layout_enumerate( const WCHAR *name )
+{
+    WCHAR root[MAX_PATH];
+    content_join( folder, name, root );
+    SetEnvironmentVariableW( L"XODUS_CONTENT_ROOTS", root );
+    expected = 1;
+    visits = 0;
+    stop_early = FALSE;
+    HRESULT hr = enumerate_content_packages( XPackageEnumerationScope::ThisOnly, NULL, visit );
+    SetEnvironmentVariableW( L"XODUS_CONTENT_ROOTS", folder );
+    return hr == S_OK ? visits : 0xffffffffu;
+}
+
+/* The top-level Chunk element holding the most FileGroups; the registration
+ * chunk is not the one that exercises the group bound. */
+static xmlNodePtr layout_largest_chunk( xmlDocPtr doc )
+{
+    xmlNodePtr root = doc ? xmlDocGetRootElement( doc ) : NULL, best = NULL;
+    UINT most = 0;
+    for ( xmlNodePtr node = root ? root->children : NULL; node; node = node->next )
+    {
+        UINT count = 0;
+        if ( node->type != XML_ELEMENT_NODE || strcmp( ( char * )node->name, "Chunk" ) ) continue;
+        for ( xmlNodePtr group = node->children; group; group = group->next )
+            if ( group->type == XML_ELEMENT_NODE && !strcmp( ( char * )group->name, "FileGroup" ) ) count++;
+        if ( count > most )
+        {
+            most = count;
+            best = node;
+        }
+    }
+    return best;
+}
+
+static void test_layout_size()
+{
+    WCHAR root[MAX_PATH], layout[MAX_PATH], file[MAX_PATH];
+    content_package package{};
+    char *text = static_cast<char *>( malloc( 12 * 1024 * 1024 ) );
+    char identifier[33];
+    CHECK( "layout-buffer", text != NULL );
+    if ( !text ) return;
+    configure( main_config );
+    CHECK( "layout-bounds-ordered", CONTENT_XML_LIMIT == 1024 * 1024 && CONTENT_LAYOUT_XML_LIMIT == 8 * 1024 * 1024 &&
+                                        CHUNKS_FILE_GROUPS_MAX == 65536 && CHUNKS_MAX == 4096 &&
+                                        CHUNKS_FILES_MAX == 65536 );
+    /* The real FH5 layout is 3,577,674 bytes: above the default bound and
+     * below the named layout bound. */
+    fixture( L"layout-size", "Nexus.Layout", "D0000000000D", "Nexus.Base", "B00000000001", 0x71, FALSE );
+    content_join( folder, L"layout-size", root );
+    content_join( root, L"layout_00000071-1111-2222-3333-444444444444.xml", layout );
+    SIZE_T bare = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS, 0, NULL );
+    SIZE_T length = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS,
+                                  bare < LAYOUT_REAL_BYTES ? LAYOUT_REAL_BYTES - bare : 0, NULL );
+    CHECK( "layout-real-shape-size", length > CONTENT_XML_LIMIT && length < CONTENT_LAYOUT_XML_LIMIT );
+    CHECK( "layout-real-shape-written", layout_write( layout, text, length ) );
+    CHECK( "layout-default-bound-unchanged", !content_read_xml( layout ) );
+    /* The default rejection is a real bound, not a parse artifact: the same
+     * bytes parse once the caller names the layout bound. */
+    {
+        xmlDocPtr named = content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT );
+        CHECK( "layout-named-bound-reads", named != NULL );
+        CHECK( "layout-real-shape-chunk-count", named && xmlChildElementCount( xmlDocGetRootElement( named ) ) == 1959 );
+        if ( named ) xmlFreeDoc( named );
+    }
+    /* The package reader keeps its own, unchanged 256-group declaration bound;
+     * the larger read bound does not lift it. */
+    {
+        xmlDocPtr doc = content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT );
+        UINT declared = 0;
+        CHECK( "layout-real-shape-package-bound",
+               doc && !content_layout_declarations( xmlDocGetRootElement( doc )->children, 0, &declared ) &&
+                   declared == 257 && !content_load( root, &package ) );
+        if ( doc ) xmlFreeDoc( doc );
+    }
+    /* Above the named bound the layout is rejected as invalid data, exactly as
+     * any unreadable layout is, and the default bound still rejects it. */
+    length = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS, CONTENT_LAYOUT_XML_LIMIT + 1, NULL );
+    CHECK( "layout-above-named-bound-size", length > CONTENT_LAYOUT_XML_LIMIT );
+    CHECK( "layout-above-named-bound-written", layout_write( layout, text, length ) );
+    CHECK( "layout-above-named-bound-rejected", !content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT ) &&
+                                                    !content_load( root, &package ) );
+    CHECK( "layout-above-named-bound-no-query",
+           content_query_identifier( "D0000000000D", sizeof( identifier ), identifier ) == E_INVALIDARG &&
+               !identifier[0] );
+    /* The chunk reader names the same layout bound; it is not a package
+     * admission bypass, so an identifier that is not installed still fails. */
+    {
+        struct chunk_snapshot *snapshot = NULL;
+        CHECK( "layout-chunk-unknown-id",
+               chunks_load( "00000071111122223333444444444444", FALSE, &snapshot ) ==
+                       E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER &&
+                   !snapshot );
+        CHECK( "layout-chunk-unknown-id-query",
+               GetPackageInterface()->XPackageChangeChunkInstallOrder( "00000071111122223333444444444444", 0, NULL ) ==
+                   E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER );
+    }
+    /* A valid prolog DTD on otherwise-valid large XML reaches the explicit
+     * subset guard, rather than merely testing malformed XML syntax. */
+    {
+        length = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS, 0, NULL );
+        const char *dtd = "<!DOCTYPE Package [<!ENTITY synthetic 'payload'>]>\n";
+        char *start = strstr( text, "<Package>" );
+        SIZE_T dtd_length = strlen( dtd );
+        CHECK( "layout-dtd-prolog-location", start != NULL );
+        if ( start )
+        {
+            memmove( start + dtd_length, start, length - ( SIZE_T )( start - text ) + 1 );
+            memcpy( start, dtd, dtd_length );
+            length += dtd_length;
+            xmlDocPtr control = xmlReadMemory( text, ( int )length, NULL, NULL,
+                                               XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING );
+            CHECK( "layout-dtd-otherwise-valid", control && control->intSubset && length > CONTENT_XML_LIMIT );
+            if ( control ) xmlFreeDoc( control );
+            CHECK( "layout-dtd-written", layout_write( layout, text, length ) );
+            CHECK( "layout-dtd-large-rejected", !content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT ) );
+        }
+    }
+    /* A malformed or truncating tail past the old 1 MiB bound is rejected
+     * instead of being read as valid. */
+    const char *tails[] = {
+        "<Chunk Id=\"1\">\n    <FileGroup DestinationPath=\"\\\" SourcePath=\".\\\" Include=\"synthetic.dat\" />",
+    };
+    for ( const char *tail : tails )
+    {
+        length = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS, CONTENT_XML_LIMIT, tail );
+        CHECK( "layout-tail-size", length > CONTENT_XML_LIMIT && length < CONTENT_LAYOUT_XML_LIMIT );
+        CHECK( "layout-tail-written", layout_write( layout, text, length ) );
+        CHECK( "layout-tail-rejected", !content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT ) );
+    }
+    /* FileGroup bound: 16,385 (the first total the old chunk bound rejected)
+     * and the real 21,488 are admitted; above the named bound is not. One chunk
+     * carries every group, so the bound itself decides. The registration chunk
+     * already holds one group, so the chunk under test holds `total - 1`. */
+    {
+        struct chunk_snapshot *snapshot = NULL;
+        UINT counts[] = { 16385, 21488, CHUNKS_FILE_GROUPS_MAX + 1 };
+        for ( UINT in_chunk : counts )
+        {
+            const UINT total = in_chunk + 1;
+            length = layout_build( text, 12 * 1024 * 1024, 1, total, 0, NULL );
+            CHECK( "layout-groups-size", length && length < CONTENT_LAYOUT_XML_LIMIT );
+            CHECK( "layout-groups-written", layout_write( layout, text, length ) );
+            /* The package reader keeps its own, unchanged declaration bound. */
+            UINT declared = 0;
+            xmlDocPtr declared_doc = content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT );
+            CHECK( "layout-groups-package-bound",
+                   !content_load( root, &package ) && declared_doc &&
+                       !content_layout_declarations( xmlDocGetRootElement( declared_doc )->children, 0, &declared ) &&
+                       declared == 257 );
+            if ( declared_doc ) xmlFreeDoc( declared_doc );
+            /* The chunk reader's group bound is reached only after reading. */
+            xmlDocPtr doc = content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT );
+            xmlNodePtr chunk = layout_largest_chunk( doc );
+            snapshot = static_cast<struct chunk_snapshot *>( calloc( 1, sizeof( *snapshot ) ) );
+            XPackageChunkAvailability availability;
+            HRESULT hr = !doc || !chunk || !snapshot
+                             ? E_OUTOFMEMORY
+                             : chunks_files( root, chunk, snapshot, 0, &availability, FALSE );
+            CHECK( "layout-groups-chunk-bound",
+                   in_chunk > CHUNKS_FILE_GROUPS_MAX ? hr == HRESULT_FROM_WIN32( ERROR_INVALID_DATA ) : hr == S_OK );
+            /* The counter is incremented before the bound is compared, so a
+             * rejected chunk records exactly one group past the bound. */
+            CHECK( "layout-groups-chunk-count",
+                   snapshot && snapshot->groups == ( in_chunk > CHUNKS_FILE_GROUPS_MAX ? CHUNKS_FILE_GROUPS_MAX + 1
+                                                                                     : in_chunk ) );
+            chunks_free( snapshot );
+            if ( doc ) xmlFreeDoc( doc );
+        }
+        /* A traversal after the old 1 MiB bound is still rejected by the chunk
+         * reader, so the larger read does not relax path validation. The only
+         * chunk after registration carries the escape declaration. */
+        {
+            SIZE_T used = 0;
+            int count = snprintf( text, 12 * 1024 * 1024,
+                                  "<?xml version=\"1.0\" encoding=\"us-ascii\"?>\n<Package>\n"
+                                  "  <Chunk Id=\"Registration\" Tags=\"OffDisc\">\n"
+                                  "    <FileGroup DestinationPath=\"\\\" SourcePath=\".\\\""
+                                  " Include=\"MicrosoftGame.Config\" />\n"
+                                  "  </Chunk>\n  <Chunk Id=\"1\" Tags=\"OffDisc\">\n"
+                                  "    <FileGroup DestinationPath=\"\\media\\assets\" SourcePath=\".\\media\\assets\""
+                                  " Include=\"synthetic.dat\" />\n" );
+            CHECK( "layout-groups-traversal-head", count > 0 );
+            used = ( SIZE_T )count;
+            used += layout_filler( text + used, CONTENT_XML_LIMIT + 4096 );
+            CHECK( "layout-groups-traversal-offset", used > CONTENT_XML_LIMIT );
+            count = snprintf( text + used, 12 * 1024 * 1024 - used,
+                              "    <FileGroup DestinationPath=\"\\..\\escape\" SourcePath=\".\\\""
+                              " Include=\"synthetic.dat\" />\n  </Chunk>\n</Package>" );
+            length = count > 0 ? used + ( SIZE_T )count : 0;
+        }
+        CHECK( "layout-groups-traversal-size", length > CONTENT_XML_LIMIT && length < CONTENT_LAYOUT_XML_LIMIT );
+        CHECK( "layout-groups-traversal-written", layout_write( layout, text, length ) );
+        xmlDocPtr doc = content_read_xml( layout, CONTENT_LAYOUT_XML_LIMIT );
+        xmlNodePtr chunk = layout_largest_chunk( doc );
+        snapshot = static_cast<struct chunk_snapshot *>( calloc( 1, sizeof( *snapshot ) ) );
+        XPackageChunkAvailability availability;
+        CHECK( "layout-groups-traversal-rejected",
+               doc && chunk && snapshot &&
+                   chunks_files( root, chunk, snapshot, 0, &availability, FALSE ) ==
+                       HRESULT_FROM_WIN32( ERROR_INVALID_DATA ) );
+        chunks_free( snapshot );
+        if ( doc ) xmlFreeDoc( doc );
+        /* The same declaration is rejected by the package reader, which keeps
+         * its own path and declaration rules. */
+        CHECK( "layout-groups-traversal-package-rejected", !content_load( root, &package ) );
+    }
+    /* Discovery end to end: neither a real-shape nor an oversized layout is
+     * admitted as installed content, because the package reader's own
+     * declaration bound is unchanged and the read bound alone admits nothing. */
+    fixture( L"layout-enumerate", "Nexus.Layout", "D0000000000E", "Nexus.Base", "B00000000001", 0x72, FALSE );
+    content_join( folder, L"layout-enumerate", root );
+    content_join( root, L"layout_00000072-1111-2222-3333-444444444444.xml", layout );
+    length = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS, 0, NULL );
+    CHECK( "layout-enumerate-real-shape-written", layout_write( layout, text, length ) );
+    /* Above the package reader's unchanged 256-declaration bound, so it is not
+     * enumerated as installed content; the larger read bound alone does not
+     * admit it. */
+    CHECK( "layout-enumerate-real-shape-rejected", layout_enumerate( L"layout-enumerate" ) == 0 );
+    length = layout_build( text, 12 * 1024 * 1024, LAYOUT_REAL_CHUNKS, LAYOUT_REAL_GROUPS, CONTENT_LAYOUT_XML_LIMIT + 1, NULL );
+    CHECK( "layout-enumerate-oversized-written", layout_write( layout, text, length ) );
+    CHECK( "layout-enumerate-oversized-rejected", layout_enumerate( L"layout-enumerate" ) == 0 );
+    /* The package metadata inputs keep the default bound. */
+    content_join( folder, L"layout-size", root );
+    content_join( root, L"MicrosoftGame.Config", file );
+    length = layout_build( text, 12 * 1024 * 1024, 1, 2, CONTENT_XML_LIMIT, NULL );
+    CHECK( "layout-config-oversized-written", layout_write( file, text, length ) );
+    CHECK( "layout-config-default-bound-rejected", !content_read_xml( file ) && !content_load( root, &package ) );
+    free( text );
+}
+
 int main( int argc, char **argv )
 {
     WCHAR temporary[MAX_PATH];
@@ -1071,6 +1401,15 @@ int main( int argc, char **argv )
         printf( "CHECKS %u FAILURES %u\n", checks, failures );
         return failures ? 1 : 0;
     }
+    /* The layout-size bound is independent of auth, licensing and the runtime
+     * DLL: it exercises only the real XML reader, discovery, enumeration and
+     * the chunk group bound. */
+    if ( argc == 2 && !strcmp( argv[1], "--large-layout-only" ) )
+    {
+        test_layout_size();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     helpers();
     actual_runtime( NULL );
     current_fixtures();
@@ -1078,6 +1417,7 @@ int main( int argc, char **argv )
     test_mount_exclude();
     test_deployed_destination();
     test_deployed_host_source();
+    test_layout_size();
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
 }
