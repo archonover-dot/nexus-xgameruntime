@@ -4,15 +4,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-test('source-only pushes and pull requests keep source checks and skip component compilation',()=>{
+test('ordinary pushes and pull requests keep source checks and never compile components',()=>{
   const files=fs.readdirSync(path.join(root,'.github/workflows')).filter(x=>x.endsWith('.yml'));
   const text=files.map(x=>fs.readFileSync(path.join(root,'.github/workflows',x),'utf8')).join('\n');
   assert.match(text,/source:\n    runs-on:/);
   assert.ok(text.includes("node --test scripts/test-policy.test.mjs scripts/test-store-context.test.mjs scripts/test-source-only.test.mjs"));
-  assert.ok(text.includes(`component:\n    if: "!contains(github.event.head_commit.message, '[source-only]') && !contains(github.event.pull_request.title, '[source-only]')"`));
-  for(const message of ['ordinary source','[source-only] source integration'])
-    for(const title of ['', 'ordinary pull request','[source-only] integrate source'])
-      assert.equal(!message.includes('[source-only]')&&!title.includes('[source-only]'),!message.startsWith('[source-only]')&&!title.startsWith('[source-only]'));
+  assert.match(text,/component:\n    if: github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main'/);
+  assert.match(text,/workflow_dispatch:/);
+  assert.ok(!text.includes('[source-only]'));
+  const workflow=fs.readFileSync(path.join(root,'.github/workflows/test.yml'),'utf8');
+  const source=workflow.slice(workflow.indexOf('  source:'),workflow.indexOf('  component:'));
+  assert.ok(!/^\s+if:/m.test(source),'source job must stay unconditional');
+  const evaluate=(event,ref)=>event==='workflow_dispatch'&&ref==='refs/heads/main';
+  for(const event of ['push','pull_request'])for(const ref of ['refs/heads/main','refs/heads/develop'])
+    assert.equal(evaluate(event,ref),false);
+  assert.equal(evaluate('workflow_dispatch','refs/heads/main'),true);
+  for(const ref of ['refs/heads/develop','refs/heads/feature/example'])
+    assert.equal(evaluate('workflow_dispatch',ref),false);
 });
 test('shared waiter regression remains mandatory and its shim is fixture-only',()=>{
   const cmake=fs.readFileSync(path.join(root,'tests/CMakeLists.txt'),'utf8');

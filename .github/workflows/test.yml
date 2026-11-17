@@ -4,6 +4,7 @@ on:
     branches: [main, develop, 'feature/**', 'fix/**']
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -19,7 +20,7 @@ jobs:
         run: node --test scripts/test-policy.test.mjs scripts/test-store-context.test.mjs scripts/test-source-only.test.mjs scripts/test-xml2-source.test.mjs
       - run: git diff --check
   component:
-    if: "!contains(github.event.head_commit.message, '[source-only]') && !contains(github.event.pull_request.title, '[source-only]')"
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
