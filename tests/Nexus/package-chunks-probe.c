@@ -183,8 +183,9 @@ static void tests( void )
     /* Larger real layouts must not inherit the content helper's old 256-group
      * bound. Conversely, hostile counts/text are rejected before callbacks. */
     {
-        char *large = malloc(1200000);
-        SIZE_T used;
+        const SIZE_T layout_limit = 8u * 1024 * 1024;
+        char *large = malloc(layout_limit + 2);
+        SIZE_T used, bytes;
         CHECK("large-fixture-allocation", large != NULL);
         if (large)
         {
@@ -197,8 +198,19 @@ static void tests( void )
             for (i = 0; i < 4097; i++) used += sprintf(large + used, "<Chunk Id=\"%u\"/>", i);
             strcpy(large + used, "</Package>"); layout(large);
             enumerate(XPackageChunkSelectorType_Chunk, HRESULT_FROM_WIN32(ERROR_MORE_DATA), 0);
+            /* The larger layout bound does not apply to other XML inputs. A
+             * valid layout above the former 1 MiB bound is now supported. */
             memset(large, ' ', 1100000); memcpy(large, "<Package>", 9); strcpy(large + 1100000, "</Package>"); layout(large);
-            enumerate(XPackageChunkSelectorType_Chunk, invalid, 0);
+            enumerate(XPackageChunkSelectorType_Chunk, S_OK, 0);
+            /* Both documents are valid XML: only the byte bound distinguishes
+             * the accepted exact limit from the rejected limit plus one. */
+            for (bytes = layout_limit; bytes <= layout_limit + 1; bytes++)
+            {
+                memset(large, ' ', bytes); memcpy(large, "<Package>", 9);
+                memcpy(large + bytes - 10, "</Package>", 10); large[bytes] = 0;
+                layout(large);
+                enumerate(XPackageChunkSelectorType_Chunk, bytes == layout_limit ? S_OK : invalid, 0);
+            }
             used = sprintf(large, "<Package><Chunk Id=\"1\" Tags=\"");
             memset(large + used, 'a', 1100); strcpy(large + used + 1100, "\"/></Package>"); layout(large);
             enumerate(XPackageChunkSelectorType_Chunk, invalid, 0);
