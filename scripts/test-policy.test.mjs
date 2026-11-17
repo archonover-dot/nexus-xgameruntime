@@ -303,8 +303,15 @@ test('versioned private COM declarations must not collapse independent C++ virtu
 test('reviewed raw package probes remain independent and child DLL staging is prefix-local',()=>{
     const lock=JSON.parse(read('tests/Nexus/package-contracts.lock.json'));
     assert.equal(Object.keys(lock.originalProbes).length,5);
-    assert.deepEqual(Object.keys(lock.reviewedProbeUpdates),['package-legacy-probe.c']);
+    assert.deepEqual(Object.keys(lock.reviewedProbeUpdates),['package-legacy-probe.c','package-chunks-probe.c']);
     assert.match(lock.reviewedProbeUpdates['package-legacy-probe.c'].reason,/all inherited slots/);
+    assert.match(lock.reviewedProbeUpdates['package-chunks-probe.c'].reason,/8 MiB/);
+    const chunks=read('tests/Nexus/package-chunks-probe.c');
+    assert.match(chunks,/layout_limit = 8u \* 1024 \* 1024/);
+    assert.match(chunks,/malloc\(layout_limit \+ 2\)/);
+    assert.match(chunks,/bytes = layout_limit; bytes <= layout_limit \+ 1; bytes\+\+/);
+    assert.match(chunks,/bytes == layout_limit \? S_OK : invalid, 0/);
+    assert.match(read('src/System/Package/Content.h'),/#define CONTENT_LAYOUT_XML_LIMIT \( 8 \* 1024 \* 1024 \)/);
     for(const [name,original]of Object.entries(lock.originalProbes))
         assert.equal(crypto.createHash('sha256').update(read('tests/Nexus/'+name)).digest('hex'),lock.reviewedProbeUpdates[name]?.sha256??original,name);
     const x86=read('tests/Nexus/package-legacy-32-probe.c');
