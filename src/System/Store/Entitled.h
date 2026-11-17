@@ -503,6 +503,11 @@ struct entitled_async
     BOOL include_collection_data;
     XStoreContextHandle store;
     UINT64 store_serial, refresh;
+    /* Operation-owned current-game parent identity. A game may close its Store
+     * handle before consuming the completed result, so the result is bound to
+     * the parent product captured when this operation started, never to a
+     * later live-handle lookup or a new context reusing the same address. */
+    char game_parent[13];
     char *request;
     UINT32 page_size;
     struct entitled_page *page;
@@ -620,13 +625,17 @@ static HRESULT WINAPI entitled_provider( XAsyncOp op, const XAsyncProviderData *
         }
         if ( context->game )
         {
-            UINT64 xuid, serial;
+            /* The operation already started on a valid Store context and owns
+             * the captured signed snapshot. Delivery revalidates that captured
+             * proof (signature-derived proof_until, parent, SKU, ownership and
+             * expiry) instead of the caller's public handle, which the game may
+             * have legitimately closed after completion. Closed handles stay
+             * invalid for new operations, and a new context reusing the same
+             * address cannot rebind this result because nothing is looked up. */
             if ( !data->buffer || data->bufferSize < sizeof( XStoreGameLicense ) || !context->page )
                 return E_INVALIDARG;
-            if ( FAILED( entitled_store_identity( context->store, &xuid, &serial ) ) ||
-                 serial != context->store_serial )
-                return E_INVALIDARG;
-            return game_license_from_snapshot( context->page->snapshot, GetStoreProductId(),
+            if ( !context->game_parent[0] ) return E_INVALIDARG;
+            return game_license_from_snapshot( context->page->snapshot, context->game_parent,
                                                static_cast<XStoreGameLicense *>( data->buffer ) );
         }
         if ( !data->buffer || data->bufferSize < sizeof( void * ) || !context->page ) return E_INVALIDARG;
@@ -752,6 +761,7 @@ static HRESULT entitled_begin( XStoreContextHandle store, UINT32 kinds, UINT32 p
     context->store_serial = serial;
     context->store = store;
     context->game = game;
+    if ( game ) memcpy( context->game_parent, GetStoreProductId(), sizeof( context->game_parent ) );
     context->include_collection_data = include_collection_data;
     context->refresh = InterlockedIncrement64( &entitled_next_refresh );
     return entitled_start( context, async, FALSE );
