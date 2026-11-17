@@ -11,6 +11,10 @@
     "package-legacy-probe.c": {
       "sha256": "8e4ca535e7f741b5f11610b44fa5ff241a4068d7801ebe51394bd3de2de0c6fd",
       "reason": "Installed-content callbacks are supported: check all inherited slots, unregister, no replay and invalid inputs instead of the obsolete E_NOTIMPL expectation.; licensed content mounts reject a base game with E_ACCESSDENIED, retaining the raw inherited mount slot and null-handle assertion; adds matching Appx identity/application metadata so this denial exercises an actual base package instead of a registration-only directory"
+    },
+    "package-chunks-probe.c": {
+      "sha256": "5d4cb2ac6fa2517489e1a0235c24c078f1513c3e2da1959cfe4d3a8e8c2fa4b2",
+      "reason": "Package layouts use the reviewed 8 MiB limit: retain acceptance above the former 1 MiB bound, test exact-limit acceptance and one-byte-over rejection, and preserve all other raw ABI and malformed-input checks."
     }
   }
 }
