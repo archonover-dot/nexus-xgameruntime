@@ -115,6 +115,7 @@ template<class... Drain> static HRESULT FixtureBegin(XStoreContextHandle store, 
     HRESULT hr = entitled_store_identity(store, &xuid, &context->store_serial);
     if (FAILED(hr) || !FixtureDrain(context, drain...)) { free(context); return E_FAIL; }
     context->store = store; context->game = TRUE; context->page_size = size; context->fetch = FixtureFetch;
+    memcpy(context->game_parent, GetStoreProductId(), sizeof(context->game_parent));
     context->request = strdup("synthetic");
     return entitled_start(context, block, FALSE);
 }
