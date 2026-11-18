@@ -55,6 +55,14 @@ test('WinRT child cancellation and detached-provider lifetime remain mandatory S
  assert.match(fixture,/SetLastError\(ERROR_CANCELLED\); return FALSE/);
 });
 
+test('synthetic game-license providers capture the production parent identity before starting',()=>{
+ const fixture=read('tests/Nexus/store-context-cancellation.cpp');
+ const begin=fixture.split('static HRESULT FixtureBegin(')[1].split('#define entitled_begin')[0];
+ assert.match(begin,/memcpy\(context->game_parent, GetStoreProductId\(\), sizeof\(context->game_parent\)\);[\s\S]*return entitled_start/);
+ assert.match(read('src/System/Store/Entitled.h'),/if \( game \) memcpy\( context->game_parent, GetStoreProductId\(\), sizeof\( context->game_parent \) \)/);
+ assert.match(fixture,/ordinary\(0, E_FAIL\); ordinary\(1, S_OK\); ordinary\(2, E_ACCESSDENIED\)/);
+});
+
 test('receipt IPC cancellation and remaining-budget coverage is mandatory without changing direct callers',()=>{
  const fixture=read('tests/Nexus/receipt-ipc.cpp');
  const bridge=read('src/System/Store/Bridge.h');
