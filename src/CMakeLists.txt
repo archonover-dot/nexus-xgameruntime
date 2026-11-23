@@ -94,3 +94,7 @@ include( ${PROJECT_SOURCE_DIR}/cmake/Builtin.cmake )
 install( TARGETS xgameruntime
         RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} )
+
+# Python is architecture-independent; install the helper with each Wine module.
+configure_file(System/nexus-text-entry.py ${CMAKE_BINARY_DIR}/bin/nexus-text-entry.py COPYONLY)
+install(FILES System/nexus-text-entry.py DESTINATION ${CMAKE_INSTALL_LIBDIR})

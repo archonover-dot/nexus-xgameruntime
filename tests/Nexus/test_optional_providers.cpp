@@ -304,19 +304,19 @@ TEST( NexusOptionalAbi, IXAccessibilityImpl2OriginalSlotsRemainCallable )
         using Function = HRESULT( WINAPI * )( void *self, const char *speakerName, const char *content,
                                               XSpeechToTextType type, UINT32 *hypothesisId );
         auto call = reinterpret_cast<Function>( table[17] );
-        EXPECT_EQ( call( object, {}, {}, {}, {} ), E_NOTIMPL );
+        EXPECT_EQ( call( object, {}, {}, {}, {} ), E_INVALIDARG );
     }
     {
         // Frozen original C table slot 18: x_accessibility_XSpeechToTextUpdateHypothesisString
         using Function = HRESULT( WINAPI * )( void *self, UINT32 hypothesisId, const char *content );
         auto call = reinterpret_cast<Function>( table[18] );
-        EXPECT_EQ( call( object, {}, {} ), E_NOTIMPL );
+        EXPECT_EQ( call( object, {}, {} ), E_INVALIDARG );
     }
     {
         // Frozen original C table slot 19: x_accessibility_XSpeechToTextFinalizeHypothesisString
         using Function = HRESULT( WINAPI * )( void *self, UINT32 hypothesisId, const char *content );
         auto call = reinterpret_cast<Function>( table[19] );
-        EXPECT_EQ( call( object, {}, {} ), E_NOTIMPL );
+        EXPECT_EQ( call( object, {}, {} ), E_INVALIDARG );
     }
     {
         // Frozen original C table slot 20: x_accessibility_XSpeechToTextCancelHypothesisString
