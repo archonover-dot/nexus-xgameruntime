@@ -5,6 +5,7 @@ from pathlib import Path
 import struct
 import sys
 import unittest
+from unittest import mock
 
 file = Path(__file__).resolve().parents[2] / 'src/System/nexus-text-entry.py'
 spec = importlib.util.spec_from_file_location('native_entry', file)
@@ -52,6 +53,19 @@ class NativeTextEntry(unittest.TestCase):
     def test_embedded_nul_is_not_silently_returned_as_shorter_text(self):
         with self.assertRaises(ValueError):
             module.read_request(io.BytesIO(request(('', '', 'a\0b'))))
+
+    def test_host_cleanup_preserves_only_the_private_bridge_token_and_display(self):
+        env = {'NEXUS_NATIVE_TEXT_TOKEN': 'ab' * 32, 'XODUS_ACCOUNT_SECRET': 'not forwarded',
+               'XUSER_AUTH_METADATA_LOG': 'not forwarded', 'LD_LIBRARY_PATH': 'proton libraries',
+               'PYTHONPATH': 'proton modules', 'WAYLAND_DISPLAY': 'wayland-test'}
+        with mock.patch.dict(module.os.environ, env, clear=True), mock.patch.object(module.os, 'execve') as execute:
+            module.clean_host_environment()
+            clean = execute.call_args.args[2]
+        self.assertEqual(clean['NEXUS_NATIVE_TEXT_TOKEN'], 'ab' * 32)
+        self.assertEqual(clean['WAYLAND_DISPLAY'], 'wayland-test')
+        for name in ('XODUS_ACCOUNT_SECRET', 'XUSER_AUTH_METADATA_LOG', 'LD_LIBRARY_PATH', 'PYTHONPATH'):
+            self.assertNotIn(name, clean)
+        self.assertEqual(clean['PATH'], '/usr/bin:/bin')
 
     def test_results_include_utf8_terminator_but_cancel_returns_no_text(self):
         output = io.BytesIO()

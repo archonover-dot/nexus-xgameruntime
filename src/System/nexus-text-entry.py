@@ -195,7 +195,7 @@ def main():
     except ValueError:
         parser.error('Invalid authentication token')
     if len(token) != 32:
-        parser.error('Invalid authentication token')
+        parser.error('Missing private authentication channel')
     with socket.create_connection(('127.0.0.1', options.port), timeout=10) as channel:
         channel.settimeout(None)
         channel.sendall(token)

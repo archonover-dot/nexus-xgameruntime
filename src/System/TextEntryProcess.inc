@@ -79,77 +79,66 @@ static HRESULT text_entry_process( TextEntryContext *ctx )
     unsigned char token[32];
     if ( BCryptGenRandom( nullptr, token, sizeof( token ), BCRYPT_USE_SYSTEM_PREFERRED_RNG ) )
         return E_FAIL;
-    std::wstring encoded;
-    const WCHAR *hex = L"0123456789abcdef";
-    for ( unsigned char value : token )
-    {
-        encoded += hex[value >> 4];
-        encoded += hex[value & 15];
-    }
     WCHAR directory[32768];
     UINT length = GetSystemDirectoryW( directory, 32768 );
     if ( !length || length >= 32768 )
         return E_FAIL;
-    // The runtime stages the helper beside the prefix's system DLLs. Resolve its
-    // real host path through Wine rather than depending on a username or install root.
-    std::wstring helperDos = std::wstring( directory ) + L"\\nexus-text-entry.py";
-    using UnixPathFunction = char *(CDECL *)( LPCWSTR );
-    auto unixPath = reinterpret_cast<UnixPathFunction>(
-        GetProcAddress( GetModuleHandleW( L"kernel32.dll" ), "wine_get_unix_file_name" ) );
-    if ( !unixPath )
-        return E_NOTIMPL;
-    char *host = unixPath( helperDos.c_str() );
-    if ( !host )
-        return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
-    std::wstring helper;
-    bool valid = text_entry_wide( host, helper );
-    HeapFree( GetProcessHeap(), 0, host );
-    if ( !valid )
-        return E_INVALIDARG;
-    std::wstring application = std::wstring( directory ) + L"\\start.exe";
-    std::wstring command = text_entry_quote( application ) + L" /wait /unix /usr/bin/python3 " +
-                           text_entry_quote( helper ) + L" --port " +
+    // The paired runtime stages the matching PE bridge in this architecture's
+    // system directory. The bridge resolves its host Python helper itself.
+    std::wstring application = std::wstring( directory ) + L"\\nexus-text-entry-host.exe";
+    std::wstring command = text_entry_quote( application ) + L" --port " +
                            std::to_wstring( ntohs( address.sin_port ) );
-    // The credential goes in the child's private environment, never its public argv.
-    LPWCH inheritedEnvironment = GetEnvironmentStringsW();
-    if ( !inheritedEnvironment )
+    // A private inherited stdin pipe carries the one-use token. Wine's Unix
+    // launcher does not reliably forward custom Windows environment entries.
+    SECURITY_ATTRIBUTES security{ sizeof( security ), nullptr, TRUE };
+    HANDLE input = nullptr, inputWriter = nullptr;
+    if ( !CreatePipe( &input, &inputWriter, &security, sizeof( token ) ) )
+        return HRESULT_FROM_WIN32( GetLastError() );
+    SetHandleInformation( inputWriter, HANDLE_FLAG_INHERIT, 0 );
+    DWORD written = 0;
+    BOOL sentToken = WriteFile( inputWriter, token, sizeof( token ), &written, nullptr );
+    CloseHandle( inputWriter );
+    if ( !sentToken || written != sizeof( token ) )
+    {
+        CloseHandle( input );
+        return E_FAIL;
+    }
+    HANDLE output = CreateFileW( L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+    if ( output == INVALID_HANDLE_VALUE )
+    {
+        CloseHandle( input );
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
+    SIZE_T attributeSize = 0;
+    InitializeProcThreadAttributeList( nullptr, 1, 0, &attributeSize );
+    auto *attributeList = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+        HeapAlloc( GetProcessHeap(), 0, attributeSize ) );
+    if ( !attributeList )
+    {
+        CloseHandle( input );
+        CloseHandle( output );
         return E_OUTOFMEMORY;
-    std::vector<std::wstring> entries;
-    std::vector<WCHAR> environment;
-    try
-    {
-        for ( const WCHAR *entry = inheritedEnvironment; *entry; entry += wcslen( entry ) + 1 )
-        {
-            if ( !_wcsnicmp( entry, L"NEXUS_NATIVE_TEXT_TOKEN=", 24 ) )
-                continue;
-            entries.emplace_back( entry );
-        }
-        entries.emplace_back( L"NEXUS_NATIVE_TEXT_TOKEN=" + encoded );
-        std::sort( entries.begin(), entries.end(),
-                   []( const auto &a, const auto &b ) { return _wcsicmp( a.c_str(), b.c_str() ) < 0; } );
-        for ( auto &entry : entries )
-        {
-            environment.insert( environment.end(), entry.begin(), entry.end() );
-            environment.push_back( 0 );
-            SecureZeroMemory( entry.data(), entry.size() * sizeof( WCHAR ) );
-        }
-        environment.push_back( 0 );
-        SecureZeroMemory( encoded.data(), encoded.size() * sizeof( WCHAR ) );
     }
-    catch ( ... )
-    {
-        FreeEnvironmentStringsW( inheritedEnvironment );
-        throw;
-    }
-    FreeEnvironmentStringsW( inheritedEnvironment );
-    STARTUPINFOW startup{};
-    startup.cb = sizeof( startup );
+    HANDLE inherited[] = { input, output };
+    BOOL initialized = InitializeProcThreadAttributeList( attributeList, 1, 0, &attributeSize );
+    BOOL restricted = initialized && UpdateProcThreadAttribute( attributeList, 0,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof( inherited ), nullptr, nullptr );
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof( startup );
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = input;
+    startup.StartupInfo.hStdOutput = output;
+    startup.StartupInfo.hStdError = output;
+    startup.lpAttributeList = attributeList;
     PROCESS_INFORMATION process{};
-    BOOL started = CreateProcessW( application.c_str(), command.data(), nullptr, nullptr, FALSE,
-                                   CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, environment.data(), nullptr,
-                                   &startup, &process );
+    BOOL started = restricted && CreateProcessW( application.c_str(), command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo, &process );
     DWORD error = started ? ERROR_SUCCESS : GetLastError();
-    SecureZeroMemory( environment.data(), environment.size() * sizeof( WCHAR ) );
+    if ( initialized ) DeleteProcThreadAttributeList( attributeList );
+    HeapFree( GetProcessHeap(), 0, attributeList );
+    CloseHandle( input );
+    CloseHandle( output );
     if ( !started )
         return HRESULT_FROM_WIN32( error );
     CloseHandle( process.hThread );
