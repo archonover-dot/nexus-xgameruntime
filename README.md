@@ -13,22 +13,23 @@ Associated-product queries use the public retail catalog with fixed 25-item serv
 Schema-0 Windows packages that declare a `TitleId` but no `MSAAppId` use signed
 Windows title authentication with the existing device token and proof key. The
 runtime accepts the returned title token only when its server claim matches the
-configured title. It then obtains title-bearing XSTS authorization and signs the
-current-title endpoint-discovery request with the same key. Explicit MSA clients
-retain the existing SISU flow. A platform sign-in token is not proof of the
-running game's identity.
+configured title. It then obtains title-bearing XSTS authorization bound to the
+signed-in account's canonical XUID and signs the current-title endpoint-discovery
+request with the same key. Explicit MSA clients retain the existing SISU flow. If
+optional title authentication is refused or cannot be bound to that account,
+local sign-in and platform discovery continue without title authorization. A
+platform sign-in token is not proof of the running game's identity.
 
-This resolves FH5's fallback Festival Playlist and unavailable online services
-on the tested Microsoft Store PC build. Local x64 validation included loading the
-live Festival Playlist and joining Hide & Seek as a seeker with other cars
-visible; it does not establish compatibility for every game or a completed race.
+Support is limited to this schema-0 Microsoft Store package case; other games,
+online features and completed matches are not verified.
 
 The protocol approach was informed by [Ferestre's title-authentication work](https://github.com/icex/xodus/commit/41c9baa928bfec32d52b2d7a011f160c6523f31e)
 and its [authentication notes](https://github.com/icex/ferestre/blob/main/docs/XBOX_LIVE.md).
 The implementation here uses Nexus's existing transport, signing and claim
-validation. `nexus_windows-title-auth` tests the request, mismatched/malformed
-claims, server refusal, missing tokens, cancellation before a request, and the
-full legacy sign-in through signed title endpoint discovery with synthetic data.
+validation. `nexus_windows-title-auth` tests the request, mismatched, malformed
+and foreign claims, missing tokens, server refusal, in-flight cancellation and
+the full legacy sign-in through title-bound, signed endpoint discovery with
+synthetic data.
 
 ## Building
 
