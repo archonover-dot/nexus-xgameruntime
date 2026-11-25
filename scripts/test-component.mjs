@@ -8,6 +8,7 @@ const buildArg = process.argv[2];
 if (!buildArg || process.argv.length !== 3) throw Error('Usage: test-component.mjs BUILD_DIRECTORY');
 const build = fs.realpathSync(buildArg), bin = path.join(build, 'bin');
 const probes = [
+    ['nexus_windows-title-auth', 82],
     ['nexus_token-endpoint', 36],
     ['nexus_backend-request', 356], ['nexus_backend-cancellation', 211], ['nexus_http-cancellation', 137], ['nexus_http-cancellation-monitor', 30],
     ['nexus_store-context', 61],

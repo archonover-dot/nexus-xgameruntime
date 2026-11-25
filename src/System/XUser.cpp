@@ -119,7 +119,8 @@ static void auth_metadata( const char *phase, XUserHandle user, HRESULT hr, DWOR
     LARGE_INTEGER size, end;
     HANDLE file;
     unsigned int i;
-    static const char *const phases[] = { "sisu",
+    static const char *const phases[] = { "windows-title",
+                                          "sisu",
                                           "resolve-privilege",
                                           "get-token-complete",
                                           "get-token-begin",
@@ -728,6 +729,59 @@ cleanup:
     return hr;
 }
 
+/* Legacy Windows packages can identify their title without an MSA client.
+ * Request genuine device/proof-bound title authentication, then retain the
+ * existing strict server-claim check. No fallback application becomes a title. */
+static HRESULT windows_title_auth( XUserHandle user )
+{
+    const auto *config = nexus::GetGameConfiguration();
+    if ( !config || !config->titleId || !config->msaAppId.empty() ||
+         config->game.attribute( "configVersion" ) != "0" ) return E_INVALIDARG;
+    if ( user->cancelled ) return E_ABORT;
+    if ( !user->deviceToken || !user->proofKey ) return E_GAMEUSER_NO_AUTH_USER;
+    char *body = NULL, *bound = NULL;
+    BYTE *buffer = NULL;
+    SIZE_T responseSize = 0;
+    DWORD status = 0;
+    IJsonObject *object = NULL;
+    HSTRING token = NULL;
+    UINT32 claimed = 0;
+    HRESULT hr;
+    SIZE_T capacity = strlen( user->deviceToken ) + strlen( user->proofKey ) + 256;
+    if ( !( body = static_cast<char *>( calloc( 1, capacity ) ) ) ) return E_OUTOFMEMORY;
+    int count = snprintf( body, capacity,
+        "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{"
+        "\"DeviceToken\":\"%s\",\"TitleId\":%lu,\"ProofKey\":%s}}",
+        user->deviceToken, static_cast<unsigned long>( config->titleId ), user->proofKey );
+    if ( count < 0 || static_cast<SIZE_T>( count ) >= capacity ) { hr = E_INVALIDARG; goto done; }
+    hr = xuser_signed_request( user, "POST", "https://title.auth.xboxlive.com/title/authenticate", NULL,
+        "Content-Type: application/json\r\nx-xbl-contract-version: 1\r\n", body, count,
+        &status, &buffer, &responseSize );
+    if ( FAILED( hr ) ) goto done;
+    if ( user->cancelled ) { hr = E_ABORT; goto done; }
+    if ( status != 200 ) { hr = HRESULT_FROM_WIN32( ERROR_ACCESS_DENIED ); goto done; }
+    if ( FAILED( hr = parse_json( reinterpret_cast<char *>( buffer ), responseSize, &object ) ) ) goto done;
+    if ( FAILED( hr = title_token_claim_title( object, &claimed ) ) ) goto done;
+    if ( claimed != config->titleId ) { hr = E_ACCESSDENIED; goto done; }
+    if ( FAILED( hr = get_json_string( object, L"Token", &token ) ) ) goto done;
+    bound = hstring_to_utf8( token );
+    if ( !bound || !*bound ) { hr = E_UNEXPECTED; goto done; }
+    free( user->titleToken );
+    user->titleToken = bound;
+    bound = NULL;
+    user->titleTokenTitleId = claimed;
+    hr = S_OK;
+done:
+    auth_metadata( "windows-title", user, hr, status, TRUE, SUCCEEDED( hr ) );
+    nexus::title_identity::WriteBinding( config, hr, claimed, SUCCEEDED( hr ) ? "bound" : "missing" );
+    if ( token ) WindowsDeleteString( token );
+    if ( object ) object->Release();
+    free( bound );
+    free( buffer );
+    free( body );
+    return hr;
+}
+
 HRESULT XUser::LoadEndpoints( const BYTE *buffer, SIZE_T size )
 {
     XUser *user = this;
@@ -935,6 +989,7 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     HRESULT hr;
     SilentUserTickets silentTickets( user );
     bool overlappingTickets = false;
+    const auto *legacyConfig = nexus::GetGameConfiguration();
 
     /* The launcher already found Microsoft unreachable; fail as the network would. */
     if ( nexus::user::ForcedOffline() ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
@@ -992,6 +1047,27 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     {
         hr = E_ABORT;
         goto cleanup;
+    }
+    if ( legacyConfig && legacyConfig->msaAppId.empty() &&
+         legacyConfig->game.attribute( "configVersion" ) == "0" && legacyConfig->titleId )
+    {
+        if ( FAILED( hr = windows_title_auth( impl ) ) ) goto cleanup;
+        char *titleAuthorization = NULL;
+        hr = xsts_authorize( impl, "http://xboxlive.com", TRUE, &titleAuthorization );
+        if ( FAILED( hr ) ) { free( titleAuthorization ); goto cleanup; }
+        char signature[105] = { 0 };
+        hr = impl->GetSignature( 1, "GET", "https://title.mgt.xboxlive.com/titles/current/endpoints",
+                                 titleAuthorization, 0, NULL, signature );
+        if ( SUCCEEDED( hr ) )
+        {
+            std::string headers = std::string( "Authorization: " ) + titleAuthorization +
+                "\r\nSignature: " + signature + "\r\nx-xbl-contract-version: 1\r\n";
+            WCHAR *signedHeaders = utf8_to_wide( headers.c_str() );
+            if ( !signedHeaders ) hr = E_OUTOFMEMORY;
+            else { free( auth ); auth = signedHeaders; }
+        }
+        free( titleAuthorization );
+        if ( FAILED( hr ) ) goto cleanup;
     }
     auth_metadata( "init-current-begin", user, E_PENDING, 0, FALSE, FALSE );
     hr = user->transport.HttpCancellable( L"GET", L"https://title.mgt.xboxlive.com/titles/current/endpoints", NULL, auth,
